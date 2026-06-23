@@ -288,26 +288,60 @@ async def extract_server_info(page):
 
 async def extract_server_detail_info(page):
     """从服务器详情页 /server/{id} 提取利用期限（韩语/英语/中文/日语）"""
-    info = {"expiry_date": ""}
+    info = {"expiry_date": "", "renew_available": None, "renew_button_disabled": None}
     try:
         js = r"""
             (function() {
                 const body = document.body.innerText || '';
                 const html = document.documentElement.innerHTML || '';
-                // 严格模式匹配利用期限日期，排除 created_at/updated_at
+                // 利用期限关键词（韩语/英语/中文/日语）
+                // 注意：weirdhost 实际用的是「예측기간」（预测期间）
                 let expiry = '';
                 const patterns = [
-                    /(?:이용기한|이용\s*기한|만료일|만료\s*일|연장\s*일)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
-                    /(?:利用期限|利用\s*期限|到期日?|有効期限|延長\s*日)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
-                    /(?:expir(?:y|ation)(?:\s*date)?|expires\s*on|valid\s*until)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/i,
-                    /(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))\s*(?:까지|만료|到期)/,
-                    /(?:이용기한|만료일|expir|到期|利用期限)[^\d]{0,30}(20\d{2}[-./]\d{1,2}[-./]\d{1,2})/i,
+                    // 1. 严格匹配：关键词 + 日期(可带时间)
+                    /(?:예측기간|예측\s*기간|이용기한|이용\s*기한|만료일|만료\s*일|연장\s*일|이용\s*기간)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
+                    /(?:利用期限|利用\s*期限|到期日?|有効期限|延長\s*日)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
+                    /(?:expir(?:y|ation)(?:\s*date)?|expires\s*on|valid\s*until)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i,
+                    // 2. 日期 + 까지/만료/到期 后缀
+                    /(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s*(?:까지|만료|到期)/,
+                    // 3. 关键词后 30 字符内任意位置出现日期
+                    /(?:예측기간|이용기한|만료일|expir|到期|利用期限|有効期限)[^\d]{0,40}(20\d{2}[-./]\d{1,2}[-./]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i,
                 ];
                 for (const p of patterns) {
                     const m = body.match(p) || html.match(p);
                     if (m) { expiry = m[1]; break; }
                 }
-                return JSON.stringify({expiry: expiry});
+
+                // 检测续期按钮状态
+                let renewAvailable = null;
+                let renewDisabled = null;
+                // 找含 '연장하기' / '연장' / 'renew' / 'extend' 文字的按钮
+                const btns = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"]'));
+                for (const b of btns) {
+                    const t = (b.innerText || b.value || '').trim().toLowerCase();
+                    if (/연장|renew|extend|갱신/i.test(t)) {
+                        renewAvailable = t;
+                        renewDisabled = b.disabled === true || b.classList.contains('disabled') || b.getAttribute('aria-disabled') === 'true';
+                        // 检查 CSS 是否禁用（cursor: not-allowed / opacity < 0.5）
+                        const style = window.getComputedStyle(b);
+                        if (style.cursor === 'not-allowed' || parseFloat(style.opacity) < 0.5) {
+                            renewDisabled = true;
+                        }
+                        break;
+                    }
+                }
+
+                // 检测「N일 후에 연장할수있어요」/「N days until renewal」提示
+                let waitingDays = null;
+                const waitMatch = body.match(/(\d+)\s*일\s*후에\s*연장/) || body.match(/(\d+)\s*days?\s*(?:until|before)\s*(?:renew|extend)/i);
+                if (waitMatch) waitingDays = parseInt(waitMatch[1]);
+
+                return JSON.stringify({
+                    expiry: expiry,
+                    renewAvailable: renewAvailable,
+                    renewDisabled: renewDisabled,
+                    waitingDays: waitingDays
+                });
             })()
         """
         result = await page.evaluate(js, return_by_value=True)
@@ -316,6 +350,9 @@ async def extract_server_detail_info(page):
                 d = json.loads(result)
                 if d.get("expiry"):
                     info["expiry_date"] = d["expiry"]
+                info["renew_available"] = d.get("renewAvailable")
+                info["renew_button_disabled"] = d.get("renewDisabled")
+                info["waiting_days"] = d.get("waitingDays")
             except Exception:
                 pass
     except Exception as e:
@@ -733,6 +770,29 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
             await save_debug_screenshot(page, "not_logged_in", index)
             return False, "Cookie 已失效，请重新登录获取最新 Cookie"
 
+        # 等 Pterodactyl Vue 异步渲染服务器列表（最多等 15 秒）
+        print(f"  [debug] 等待服务器列表渲染...")
+        for wait_i in range(15):
+            has_links = await page.evaluate(r"""
+                (function() {
+                    return document.querySelectorAll('a[href*="/server/"]').length;
+                })()
+            """, return_by_value=True)
+            count = 0
+            if isinstance(has_links, (int, float)):
+                count = int(has_links)
+            elif isinstance(has_links, str):
+                try:
+                    count = int(has_links)
+                except Exception:
+                    pass
+            if count > 0:
+                print(f"  [debug] 渲染完成，发现 {count} 个服务器链接（等待 {wait_i} 秒）")
+                break
+            await asyncio.sleep(1)
+        else:
+            print(f"  [debug] 等待 15 秒后仍无服务器链接，可能服务器列表为空或加载失败")
+
         # ===== 阶段 2.5: 提取服务器信息 + 利用期限 =====
         print("  [2.5/4] 提取服务器信息和利用期限...")
         server_info = await extract_server_info(page)
@@ -761,19 +821,28 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                     if detail_info["expiry_date"]:
                         expiry_date = detail_info["expiry_date"]
                         print(f"  [info] ✓ 从详情页提取到利用期限: {expiry_date}")
-                        # 在详情页面上继续找 Renew 按钮（不再回 dashboard）
-                        # 计算剩余天数
-                        days_left = days_until_expiry(expiry_date)
-                        if days_left is not None:
-                            print(f"  [info] 距离到期还有 {days_left} 天（续期阈值: {RENEW_THRESHOLD_DAYS} 天）")
-                            if days_left > RENEW_THRESHOLD_DAYS:
-                                msg = f"⏭ 未到期（剩 {days_left} 天），跳过续期"
-                                print(f"  {msg}")
-                                notify_renew(server_name, expiry_date, f"⏭ 未到期（剩 {days_left} 天），跳过续期", index)
-                                await save_debug_screenshot(page, "not_expired_skipped", index)
-                                return True, msg
-                        # 在详情页找 Renew 按钮
-                        print(f"  [3/4] 在服务器详情页查找 Renew 按钮...（已到期或剩余 ≤ {RENEW_THRESHOLD_DAYS} 天）")
+                        print(f"  [info] 续期按钮: {detail_info.get('renew_available') or '(未找到)'}")
+                        print(f"  [info] 按钮禁用: {detail_info.get('renew_button_disabled')}")
+                        if detail_info.get("waiting_days") is not None:
+                            print(f"  [info] 距离可续期还有 {detail_info['waiting_days']} 天")
+
+                        # 判断按钮是否禁用 / 还需等待
+                        waiting_days = detail_info.get("waiting_days")
+                        renew_disabled = detail_info.get("renew_button_disabled")
+
+                        if renew_disabled or (waiting_days is not None and waiting_days > 0):
+                            # 按钮禁用，发送"等待续期"通知
+                            if waiting_days is not None:
+                                msg_result = f"⏳ 还需 {waiting_days} 天才能续期"
+                            else:
+                                msg_result = "⏳ 续期按钮当前禁用（未到续期时间）"
+                            print(f"  {msg_result}")
+                            notify_renew(server_name, expiry_date, msg_result, index)
+                            await save_debug_screenshot(page, "renew_waiting", index)
+                            return True, msg_result
+
+                        # 按钮可点击，执行续期
+                        print(f"  [3/4] 在服务器详情页查找 Renew 按钮...（按钮可点击，执行续期）")
                         await asyncio.sleep(2)
                         matched = await find_and_click_renew(page)
                         if not matched:
