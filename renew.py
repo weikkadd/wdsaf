@@ -239,20 +239,21 @@ async def extract_server_info(page):
         "server_urls": [],   # 服务器详情页 URL 列表
     }
     try:
-        js = """
+        # 注意：不要用 f-string，否则 [href 会被误解析
+        js = r"""
             (function() {
                 const body = document.body.innerText || '';
                 // 找服务器名（标题或品牌）
                 let serverName = 'Weirdhost';
-                const titleMatch = body.match(/(Weirdhost\\s*\\|\\s*\\w+)/i);
-                if (titleMatch) serverName = titleMatch[1].replace(/\\s+/g, '');
+                const titleMatch = body.match(/(Weirdhost\s*\|\s*\w+)/i);
+                if (titleMatch) serverName = titleMatch[1].replace(/\s+/g, '');
                 // 找利用期限/到期日（韩语/英语/中文/日语）— 严格模式，排除 created_at/updated_at
                 let expiry = '';
                 const patterns = [
-                    /(?:이용기한|이용\\s*기한|만료일|만료\\s*일)\\s*[:：]?\\s*(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/,
-                    /(?:利用期限|利用\\s*期限|到期日?|有効期限)\\s*[:：]?\\s*(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/,
-                    /(?:expir(?:y|ation)(?:\\s*date)?|expires\\s*on)\\s*[:：]?\\s*(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/i,
-                    /(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))\\s*(?:까지|만료|到期|까지)/,
+                    /(?:이용기한|이용\s*기한|만료일|만료\s*일)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
+                    /(?:利用期限|利用\s*期限|到期日?|有効期限)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
+                    /(?:expir(?:y|ation)(?:\s*date)?|expires\s*on)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/i,
+                    /(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))\s*(?:까지|만료|到期)/,
                 ];
                 for (const p of patterns) {
                     const m = body.match(p);
@@ -261,7 +262,7 @@ async def extract_server_info(page):
                 // 提取所有 /server/{id} 链接
                 const serverUrls = Array.from(document.querySelectorAll('a[href*="/server/"]'))
                     .map(a => a.href)
-                    .filter(u => /\\/server\\/[a-f0-9]+/i.test(u));
+                    .filter(u => /\/server\/[a-f0-9]+/i.test(u));
                 // 去重
                 const uniqueServerUrls = [...new Set(serverUrls)];
                 return JSON.stringify({serverName: serverName, expiry: expiry, serverUrls: uniqueServerUrls});
@@ -288,19 +289,18 @@ async def extract_server_detail_info(page):
     """从服务器详情页 /server/{id} 提取利用期限（韩语/英语/中文/日语）"""
     info = {"expiry_date": ""}
     try:
-        js = """
+        js = r"""
             (function() {
                 const body = document.body.innerText || '';
                 const html = document.documentElement.innerHTML || '';
                 // 严格模式匹配利用期限日期，排除 created_at/updated_at
                 let expiry = '';
                 const patterns = [
-                    /(?:이용기한|이용\\s*기한|만료일|만료\\s*일|연장\\s*일)\\s*[:：]?\\s*(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/,
-                    /(?:利用期限|利用\\s*期限|到期日?|有効期限|延長\\s*日)\\s*[:：]?\\s*(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/,
-                    /(?:expir(?:y|ation)(?:\\s*date)?|expires\\s*on|valid\\s*until)\\s*[:：]?\\s*(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/i,
-                    /(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))\\s*(?:까지|만료|到期)/,
-                    // 也尝试匹配 "YYYY-MM-DD HH:MM:SS" 这种带时间的格式
-                    /(?:이용기한|만료일|expir|到期|利用期限)[^\\d]{0,30}(20\\d{2}[-./]\\d{1,2}[-./]\\d{1,2})/i,
+                    /(?:이용기한|이용\s*기한|만료일|만료\s*일|연장\s*일)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
+                    /(?:利用期限|利用\s*期限|到期日?|有効期限|延長\s*日)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
+                    /(?:expir(?:y|ation)(?:\s*date)?|expires\s*on|valid\s*until)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/i,
+                    /(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))\s*(?:까지|만료|到期)/,
+                    /(?:이용기한|만료일|expir|到期|利用期限)[^\d]{0,30}(20\d{2}[-./]\d{1,2}[-./]\d{1,2})/i,
                 ];
                 for (const p of patterns) {
                     const m = body.match(p) || html.match(p);
