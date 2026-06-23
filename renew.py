@@ -28,14 +28,15 @@ LOGIN_URL = f"{BASE_URL}/login"
 
 # 候选 dashboard 路径（weirdhost 不同语言版本可能不同）
 DASHBOARD_CANDIDATES = [
+    "/servers",         # 服务器列表（韩语「서버」标签）
+    "/",                # 首页（Pterodactyl 默认就是服务器列表）
+    "/index",
     "/dashboard",
-    "/servers",
-    "/server",
-    "/my",
+    "/server",          # 单数形式
     "/home",
     "/panel",
-    "/account",
-    "/kr/dashboard",   # 韩语版可能加语言前缀
+    "/account",         # 账号设置页（最后兜底，从这里找服务器链接）
+    "/kr/dashboard",
     "/ko/dashboard",
 ]
 
@@ -623,7 +624,7 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         # ===== 阶段 2: 访问 dashboard / 服务器列表页 =====
         print("  [2/4] 查找 dashboard 页面...")
 
-        # 先尝试从首页提取 dashboard 链接
+        # 先尝试从首页提取「서버」(服务器) 链接，而不是「계정」(账号)
         dashboard_url = None
         try:
             links_json = await page.evaluate("""
@@ -634,7 +635,6 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                     })).filter(l => l.href));
                 })()
             """, return_by_value=True)
-            # 解析
             links = None
             if isinstance(links_json, str):
                 try:
@@ -642,13 +642,27 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                 except Exception:
                     links = None
             print(f"  [debug] 首页找到 {len(links) if links else 0} 个链接")
-            # 找关键词的链接
-            keywords = ["dashboard", "server", "서버", "대시보드", "panel", "계정", "마이페이지", "내 서버"]
-            for link in (links or []):
-                href = link.get("href", "")
-                text = link.get("text", "")
-                for kw in keywords:
-                    if kw.lower() in text.lower() or kw.lower() in href.lower():
+            # 优先找「서버」(韩语服务器) 链接，而不是「계정」(账号)
+            # 必须排除 /deleted-servers / /server/{id}（这些不是入口）
+            keywords_priority = [
+                ("서버", ["servers", "/server", "서버"]),
+                ("대시보드", ["dashboard", "대시보드"]),
+                ("server", ["servers", "/server"]),
+                ("dashboard", ["dashboard"]),
+            ]
+            for kw_name, kw_list in keywords_priority:
+                for link in (links or []):
+                    href = link.get("href", "")
+                    text = link.get("text", "").strip()
+                    # 必须文本或 href 包含关键词
+                    if any(kw.lower() in text.lower() or kw.lower() in href.lower() for kw in kw_list):
+                        # 排除具体服务器详情页（/server/{id}）
+                        import re as _re
+                        if _re.search(r'/server/[a-f0-9]{8,}', href, _re.I):
+                            continue
+                        # 排除已删除服务器
+                        if "deleted" in href.lower():
+                            continue
                         # 转 absolute URL
                         if href.startswith("/"):
                             dashboard_url = BASE_URL + href
@@ -656,16 +670,16 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                             dashboard_url = href
                         else:
                             continue
-                        print(f"  [debug] 从首页提取到候选: text='{text}' href='{dashboard_url}'")
+                        print(f"  [debug] 从首页提取到 '{kw_name}' 链接: text='{text}' href='{dashboard_url}'")
                         break
                 if dashboard_url:
                     break
         except Exception as e:
             print(f"  [debug] 提取首页链接失败: {e}")
 
-        # 如果首页没找到，尝试候选路径
+        # 如果首页没找到「서버」链接，尝试候选路径
         if not dashboard_url:
-            print(f"  [debug] 首页未找到 dashboard 链接，开始尝试候选路径...")
+            print(f"  [debug] 首页未找到服务器列表链接，开始尝试候选路径...")
             for path in DASHBOARD_CANDIDATES:
                 candidate = BASE_URL + path
                 try:
@@ -681,10 +695,19 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                     if "/login" in url_now or "signin" in url_now:
                         print(f"  [debug] {path} → 重定向到 login，跳过")
                         continue
-                    # 成功！
-                    dashboard_url = candidate
-                    print(f"  [debug] {path} → ✓ 有效 dashboard 路径")
-                    break
+                    # 检查这个页面是否包含 /server/{id} 链接（说明是服务器列表页）
+                    has_server_links = await page.evaluate(r"""
+                        (function() {
+                            return document.querySelectorAll('a[href*="/server/"]').length > 0;
+                        })()
+                    """, return_by_value=True)
+                    if has_server_links:
+                        dashboard_url = candidate
+                        print(f"  [debug] {path} → ✓ 找到服务器列表页（含 /server/{{id}} 链接）")
+                        break
+                    else:
+                        print(f"  [debug] {path} → 有效页面但无服务器链接，跳过")
+                        continue
                 except Exception as e:
                     print(f"  [debug] {path} 异常: {e}")
                     continue
@@ -692,7 +715,7 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         if not dashboard_url:
             await save_debug_screenshot(page, "no_dashboard_found", index)
             return False, (
-                "未找到有效的 dashboard 路径（所有候选都 404 或重定向到 login）。"
+                "未找到有效的 dashboard 路径（所有候选都 404 或无服务器链接）。"
                 "请查看 Actions artifacts 中的调试截图，确认 weirdhost 实际页面结构。"
             )
 
