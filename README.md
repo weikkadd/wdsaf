@@ -1,3 +1,19 @@
+📌 1. 项目用途
+
+本项目用于：
+
+自动登录 Weirdhost
+自动保持 Cookie 有效
+定时执行续期任务
+支持多账号
+支持通知推送（Telegram / Webhook）
+🌐 2. 环境准备
+
+你只需要：
+
+GitHub 账号
+Weirdhost 账号
+浏览器（用于获取 Cookie）
 📦 3. 一键部署流程
 ✅ Step 1：Fork 仓库
 
