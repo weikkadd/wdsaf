@@ -24,8 +24,20 @@ from proxy_parser import parse_proxy, get_proxy_protocol, build_singbox_config
 
 # ===== 配置 =====
 BASE_URL = "https://hub.weirdhost.xyz"
-DASHBOARD_URL = f"{BASE_URL}/dashboard"
 LOGIN_URL = f"{BASE_URL}/login"
+
+# 候选 dashboard 路径（weirdhost 不同语言版本可能不同）
+DASHBOARD_CANDIDATES = [
+    "/dashboard",
+    "/servers",
+    "/server",
+    "/my",
+    "/home",
+    "/panel",
+    "/account",
+    "/kr/dashboard",   # 韩语版可能加语言前缀
+    "/ko/dashboard",
+]
 
 MAX_COOKIE_SLOTS = 50
 DEBUG_DIR = "/tmp/weirdhost_debug"
@@ -60,19 +72,31 @@ CF_SIGNALS = [
 CF_WAIT_MAX_SEC = 90
 CF_WAIT_INTERVAL = 3
 
-# Renew 按钮选择器（保留全面）
+# Renew 按钮选择器（全面，含韩语/英语/中文/日语）
 RENEW_SELECTORS_TEXT = [
+    # 英语
     "Renew",
     "renew",
     "RENEW",
-    "续期",
-    "续",
     "Renew Now",
     "Renewal",
     "Extend",
+    "Activate",
+    # 中文
+    "续期",
+    "续",
     "延期",
     "激活",
-    "Activate",
+    # 韩语
+    "연장하기",          # "续期"（最常用）
+    "연장",              # "延长"
+    "갱신",              # "更新"
+    "갱신하기",          # "更新"
+    "기간 연장",         # "期间延长"
+    # 日语（以防万一）
+    "更新",
+    "延長",
+    "延長する",
 ]
 
 
@@ -383,11 +407,76 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                 "3) 用住宅 IP 代理  4) 改用本地运行"
             )
 
-        # ===== 阶段 2: 访问 dashboard 验证登录态 =====
-        print("  [2/4] 访问 dashboard 验证 Cookie...")
-        page = await browser.get(DASHBOARD_URL)
-        await asyncio.sleep(3)
+        # ===== 阶段 2: 访问 dashboard / 服务器列表页 =====
+        print("  [2/4] 查找 dashboard 页面...")
 
+        # 先尝试从首页提取 dashboard 链接
+        dashboard_url = None
+        try:
+            links = await page.evaluate("""
+                () => {
+                    return Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                        text: (a.innerText || '').trim().slice(0, 30),
+                        href: a.href,
+                    })).filter(l => l.href);
+                }
+            """)
+            print(f"  [debug] 首页找到 {len(links) if links else 0} 个链接")
+            # 找关键词的链接
+            keywords = ["dashboard", "server", "서버", "대시보드", "panel", "계정", "마이페이지", "내 서버"]
+            for link in (links or []):
+                href = link.get("href", "")
+                text = link.get("text", "")
+                for kw in keywords:
+                    if kw.lower() in text.lower() or kw.lower() in href.lower():
+                        # 转 absolute URL
+                        if href.startswith("/"):
+                            dashboard_url = BASE_URL + href
+                        elif href.startswith("http"):
+                            dashboard_url = href
+                        else:
+                            continue
+                        print(f"  [debug] 从首页提取到候选: text='{text}' href='{dashboard_url}'")
+                        break
+                if dashboard_url:
+                    break
+        except Exception as e:
+            print(f"  [debug] 提取首页链接失败: {e}")
+
+        # 如果首页没找到，尝试候选路径
+        if not dashboard_url:
+            print(f"  [debug] 首页未找到 dashboard 链接，开始尝试候选路径...")
+            for path in DASHBOARD_CANDIDATES:
+                candidate = BASE_URL + path
+                try:
+                    page = await browser.get(candidate)
+                    await asyncio.sleep(2)
+                    # 检查是否 404 / 被重定向到 login
+                    title = await page.evaluate("document.title")
+                    body_text = (await page.evaluate("document.body.innerText") or "").lower()
+                    url_now = page.url.lower()
+                    if "404" in title or "not found" in body_text or "未找到" in body_text or "찾을 수 없" in body_text:
+                        print(f"  [debug] {path} → 404，跳过")
+                        continue
+                    if "/login" in url_now or "signin" in url_now:
+                        print(f"  [debug] {path} → 重定向到 login，跳过")
+                        continue
+                    # 成功！
+                    dashboard_url = candidate
+                    print(f"  [debug] {path} → ✓ 有效 dashboard 路径")
+                    break
+                except Exception as e:
+                    print(f"  [debug] {path} 异常: {e}")
+                    continue
+
+        if not dashboard_url:
+            await save_debug_screenshot(page, "no_dashboard_found", index)
+            return False, (
+                "未找到有效的 dashboard 路径（所有候选都 404 或重定向到 login）。"
+                "请查看 Actions artifacts 中的调试截图，确认 weirdhost 实际页面结构。"
+            )
+
+        # 再次 CF 检测（dashboard 也可能被拦）
         if not await wait_for_cf_clearance(page, max_sec=CF_WAIT_MAX_SEC, stage="dashboard"):
             await save_debug_screenshot(page, "dashboard_cf_blocked", index)
             return False, "Dashboard 也被 Cloudflare 拦截"

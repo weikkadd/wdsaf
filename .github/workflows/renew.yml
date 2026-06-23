@@ -36,7 +36,8 @@ jobs:
       - name: 🌐 Install Google Chrome (stable)
         run: |
           echo "=== 安装 Google Chrome 稳定版 ==="
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          # 下载 GPG key（用 --batch --yes 避免 /dev/tty 错误）
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/google-chrome.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq google-chrome-stable
