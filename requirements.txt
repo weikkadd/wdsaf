@@ -1,7 +1,12 @@
 # Weirdhost Auto Renew - Python Dependencies
 # 锁定主版本，避免 API 变更导致脚本失效
 
-playwright>=1.40,<2.0
+# nodriver 替代 Playwright（基于真实 Chrome，绕过 CF CDP 检测）
+nodriver>=0.36,<1.0
+
+# HTTP 客户端（用于通知 + 代理出网测试）
 requests>=2.28,<3.0
 PySocks>=1.7,<2.0
-playwright-stealth>=1.0,<3.0
+
+# WebSockets (nodriver 依赖)
+websockets>=14,<17
