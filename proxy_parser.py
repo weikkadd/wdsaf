@@ -419,7 +419,13 @@ def parse_proxy(uri: str) -> dict:
 
 
 def build_singbox_config(proxy_outbound: dict, socks_port: int = 1080) -> dict:
-    """构造完整的 sing-box config"""
+    """构造完整的 sing-box config (sing-box 1.12+/1.13+ 新版格式)
+
+    关键变更：
+    - DNS servers 必须用 type 字段（https/udp/tcp/quic...），不再支持 tls://xxx 旧格式
+    - 移除 dns outbound（1.13 已删除），改用 route.rules 的 action: hijack-dns
+    - DNS rules 不能用 outbound 字段，改用 route.default_domain_resolver
+    """
     return {
         "log": {
             "level": "info",
@@ -427,13 +433,20 @@ def build_singbox_config(proxy_outbound: dict, socks_port: int = 1080) -> dict:
         },
         "dns": {
             "servers": [
-                {"tag": "google", "address": "tls://8.8.8.8"},
-                {"tag": "local", "address": "223.5.5.5", "detour": "direct"},
-            ],
-            "rules": [
-                {"outbound": "any", "server": "local"},
+                {
+                    "type": "https",
+                    "tag": "google",
+                    "server": "8.8.8.8",
+                    "server_port": 443,
+                },
+                {
+                    "type": "udp",
+                    "tag": "local",
+                    "server": "223.5.5.5",
+                },
             ],
             "strategy": "ipv4_only",
+            "final": "google",
         },
         "inbounds": [
             {
@@ -460,16 +473,13 @@ def build_singbox_config(proxy_outbound: dict, socks_port: int = 1080) -> dict:
                 "type": "block",
                 "tag": "block",
             },
-            {
-                "type": "dns",
-                "tag": "dns-out",
-            },
         ],
         "route": {
+            "default_domain_resolver": "local",
             "rules": [
                 {
                     "protocol": "dns",
-                    "outbound": "dns-out",
+                    "action": "hijack-dns",
                 },
                 {
                     "ip_is_private": True,
