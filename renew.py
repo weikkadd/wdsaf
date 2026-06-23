@@ -149,8 +149,10 @@ RENEW_THRESHOLD_DAYS = int(os.getenv("RENEW_THRESHOLD_DAYS", "3"))
 def notify_renew(server_id: str, server_name: str, expiry_date: str, result: str, account_idx: int = 1) -> None:
     """发送用户期望格式的简洁续期通知（每个服务器一条）
 
+    标题用自动识别的服务器 ID（从 /account 页面扫描所有 /server/{id} 链接得到）。
+
     格式：
-        🎮 {server_id} 续期通知
+        🎮 9120ade0 续期通知
         🕐 运行时间: 2026-06-23 19:19:39
         🖥 服务器: Weirdhost|KR
         📅 利用期限: 2026-07-07 01:58:01
@@ -242,11 +244,12 @@ def days_until_expiry(expiry_date_str: str):
 
 
 async def extract_server_info(page):
-    """从 dashboard 页面提取服务器名 + 利用期限 + 服务器详情页 URL 列表（韩语/英语兼容）"""
+    """从 dashboard 页面提取服务器名 + 利用期限 + 服务器详情页 URL + 名字映射（韩语/英语兼容）"""
     info = {
         "server_name": "Weirdhost",
         "expiry_date": "",
         "server_urls": [],   # 服务器详情页 URL 列表
+        "server_names": {},  # {server_id: server_display_name} 映射
     }
     try:
         # 注意：不要用 f-string，否则 [href 会被误解析
@@ -260,7 +263,7 @@ async def extract_server_info(page):
                 // 找利用期限/到期日（韩语/英语/中文/日语）— 严格模式，排除 created_at/updated_at
                 let expiry = '';
                 const patterns = [
-                    /(?:이용기한|이용\s*기한|만료일|만료\s*일)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
+                    /(?:유통기한|유통\s*기한|예측기간|예측\s*기간|이용기한|이용\s*기한|만료일|만료\s*일)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
                     /(?:利用期限|利用\s*期限|到期日?|有効期限)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/,
                     /(?:expir(?:y|ation)(?:\s*date)?|expires\s*on)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))/i,
                     /(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01]))\s*(?:까지|만료|到期)/,
@@ -269,13 +272,42 @@ async def extract_server_info(page):
                     const m = body.match(p);
                     if (m) { expiry = m[1]; break; }
                 }
-                // 提取所有 /server/{id} 链接
-                const serverUrls = Array.from(document.querySelectorAll('a[href*="/server/"]'))
-                    .map(a => a.href)
-                    .filter(u => /\/server\/[a-f0-9]+/i.test(u));
-                // 去重
-                const uniqueServerUrls = [...new Set(serverUrls)];
-                return JSON.stringify({serverName: serverName, expiry: expiry, serverUrls: uniqueServerUrls});
+                // 提取所有 /server/{id} 链接 + 名字
+                // weirdhost 列表里：服务器名和 ID 通常在同一个 <tr> 或 <div> 内
+                const serverUrls = [];
+                const serverNames = {};
+                // 方式 1: 找所有 /server/{id} 链接，从链接文字或父元素提取名字
+                const links = Array.from(document.querySelectorAll('a[href*="/server/"]'));
+                const seen = new Set();
+                for (const a of links) {
+                    const href = a.href;
+                    const m = href.match(/\/server\/([a-f0-9]+)/i);
+                    if (!m) continue;
+                    const sid = m[1];
+                    if (seen.has(sid)) continue;
+                    seen.add(sid);
+                    serverUrls.push(href);
+                    // 提取名字：先看链接本身文字，再看父级 <tr> 或卡片内的名字
+                    let name = (a.innerText || '').trim();
+                    if (!name || name === sid) {
+                        // 找最近的 tr 或 div 容器
+                        let parent = a.closest('tr') || a.closest('[class*="card"]') || a.closest('div');
+                        if (parent) {
+                            // 在容器内找看起来像服务器名的元素（不含 ID 和数字）
+                            const candidates = parent.querySelectorAll('td, [class*="name"], [class*="title"], span, div');
+                            for (const c of candidates) {
+                                const t = (c.innerText || '').trim();
+                                // 排除：纯 ID、含数字百分比、空字符串
+                                if (t && t !== sid && !/^[a-f0-9]{8,}$/i.test(t) && !/\d+\s*%/.test(t) && t.length < 50) {
+                                    name = t;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    serverNames[sid] = name || sid;
+                }
+                return JSON.stringify({serverName: serverName, expiry: expiry, serverUrls: serverUrls, serverNames: serverNames});
             })()
         """
         result = await page.evaluate(js, return_by_value=True)
@@ -288,6 +320,8 @@ async def extract_server_info(page):
                     info["expiry_date"] = d["expiry"]
                 if d.get("serverUrls"):
                     info["server_urls"] = d["serverUrls"]
+                if d.get("serverNames"):
+                    info["server_names"] = d["serverNames"]
             except Exception:
                 pass
     except Exception as e:
@@ -821,13 +855,13 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         else:
             print(f"  [debug] 等待 15 秒后仍无服务器链接，可能服务器列表为空或加载失败")
 
-        # ===== 阶段 2.5: 提取服务器列表 =====
-        print("  [2.5/4] 提取服务器列表...")
+        # ===== 阶段 2.5: 提取服务器列表（自动识别所有 /server/{id}）=====
+        print("  [2.5/4] 提取服务器列表（自动扫描 /account 页面所有 /server/{id} 链接）...")
         server_info = await extract_server_info(page)
         server_name = server_info["server_name"]
         server_urls = server_info.get("server_urls", [])
         print(f"  [info] 服务器名: {server_name}")
-        print(f"  [info] 发现 {len(server_urls)} 个服务器详情页: {server_urls}")
+        print(f"  [info] 发现 {len(server_urls)} 个服务器（自动识别）: {server_urls}")
 
         # 如果没有服务器，直接结束
         if not server_urls:
@@ -841,7 +875,7 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         results_summary = []
 
         for srv_idx, srv_url in enumerate(server_urls, 1):
-            # 从 URL 提取 server_id，例如 https://hub.weirdhost.xyz/server/9120ade0 → 9120ade0
+            # 从 URL 提取 server_id（自动识别），例如 https://hub.weirdhost.xyz/server/9120ade0 → 9120ade0
             server_id = srv_url.rstrip("/").split("/")[-1]
             print(f"\n  --- 服务器 {srv_idx}/{len(server_urls)}: {server_id} ({srv_url}) ---")
 
