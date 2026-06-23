@@ -295,17 +295,17 @@ async def extract_server_detail_info(page):
                 const body = document.body.innerText || '';
                 const html = document.documentElement.innerHTML || '';
                 // 利用期限关键词（韩语/英语/中文/日语）
-                // 注意：weirdhost 实际用的是「예측기간」（预测期间）
+                // 注意：weirdhost 实际用的是「유통기한」（保质期）和「예측기간」（预测期间）
                 let expiry = '';
                 const patterns = [
                     // 1. 严格匹配：关键词 + 日期(可带时间)
-                    /(?:예측기간|예측\s*기간|이용기한|이용\s*기한|만료일|만료\s*일|연장\s*일|이용\s*기간)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
-                    /(?:利用期限|利用\s*期限|到期日?|有効期限|延長\s*日)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
+                    /(?:유통기한|유통\s*기한|예측기간|예측\s*기간|이용기한|이용\s*기한|만료일|만료\s*일|연장\s*일|이용\s*기간)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
+                    /(?:利用期限|利用\s*期限|到期日?|有効期限|延長\s*日|保质期|保存期)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
                     /(?:expir(?:y|ation)(?:\s*date)?|expires\s*on|valid\s*until)\s*[:：]?\s*(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i,
                     // 2. 日期 + 까지/만료/到期 后缀
                     /(20\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s*(?:까지|만료|到期)/,
-                    // 3. 关键词后 30 字符内任意位置出现日期
-                    /(?:예측기간|이용기한|만료일|expir|到期|利用期限|有効期限)[^\d]{0,40}(20\d{2}[-./]\d{1,2}[-./]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i,
+                    // 3. 关键词后 40 字符内任意位置出现日期
+                    /(?:유통기한|예측기간|이용기한|만료일|expir|到期|利用期限|有効期限|保质期)[^\d]{0,40}(20\d{2}[-./]\d{1,2}[-./]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i,
                 ];
                 for (const p of patterns) {
                     const m = body.match(p) || html.match(p);
@@ -817,6 +817,23 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                     if not await is_logged_in(page):
                         print(f"  [warn] 服务器详情页跳转到 login，跳过")
                         continue
+
+                    # 等待 '유통기한' / '예측기간' / '연장하기' 出现（最多 20 秒）
+                    print(f"  [debug] 等待详情页渲染 '유통기한' / '연장하기' ...")
+                    for wait_i in range(20):
+                        found_kw = await page.evaluate(r"""
+                            (function() {
+                                const html = document.documentElement.innerHTML || '';
+                                return /유통기한|예측기간|이용기한|만료일|연장하기|expir/i.test(html);
+                            })()
+                        """, return_by_value=True)
+                        if found_kw:
+                            print(f"  [debug] 详情页关键字已渲染（等待 {wait_i} 秒）")
+                            break
+                        await asyncio.sleep(1)
+                    else:
+                        print(f"  [warn] 详情页等待 20 秒后仍未出现关键字")
+
                     detail_info = await extract_server_detail_info(page)
                     if detail_info["expiry_date"]:
                         expiry_date = detail_info["expiry_date"]
