@@ -340,16 +340,33 @@ async def extract_server_detail_info(page):
                     }
                 }
 
-                // 检测「N일 후에 연장할수있어요」/「N days until renewal」提示
+                // 检测「N일/N시간/N분 후에 연장할수있어요」/「N days until renewal」提示
                 let waitingDays = null;
-                const waitMatch = body.match(/(\d+)\s*일\s*후에\s*연장/) || body.match(/(\d+)\s*days?\s*(?:until|before)\s*(?:renew|extend)/i);
-                if (waitMatch) waitingDays = parseInt(waitMatch[1]);
+                let waitingHours = null;
+                let waitingMinutes = null;
+                const dayMatch = body.match(/(\d+)\s*일\s*후에\s*연장/) || body.match(/(\d+)\s*days?\s*(?:until|before)\s*(?:renew|extend)/i);
+                if (dayMatch) waitingDays = parseInt(dayMatch[1]);
+                const hourMatch = body.match(/(\d+)\s*시간\s*후에\s*연장/) || body.match(/(\d+)\s*hours?\s*(?:until|before)\s*(?:renew|extend)/i);
+                if (hourMatch) waitingHours = parseInt(hourMatch[1]);
+                const minMatch = body.match(/(\d+)\s*분\s*후에\s*연장/) || body.match(/(\d+)\s*minutes?\s*(?:until|before)\s*(?:renew|extend)/i);
+                if (minMatch) waitingMinutes = parseInt(minMatch[1]);
+                // 也匹配单纯出现 "15시간" / "3일" 这种简短形式（weirdhost 用法）
+                if (waitingDays === null && waitingHours === null && waitingMinutes === null) {
+                    const shortDay = body.match(/(\d+)\s*일\s*후/);
+                    if (shortDay) waitingDays = parseInt(shortDay[1]);
+                    const shortHour = body.match(/(\d+)\s*시간/);
+                    if (shortHour) waitingHours = parseInt(shortHour[1]);
+                    const shortMin = body.match(/(\d+)\s*분/);
+                    if (shortMin) waitingMinutes = parseInt(shortMin[1]);
+                }
 
                 return JSON.stringify({
                     expiry: expiry,
                     renewAvailable: renewAvailable,
                     renewDisabled: renewDisabled,
-                    waitingDays: waitingDays
+                    waitingDays: waitingDays,
+                    waitingHours: waitingHours,
+                    waitingMinutes: waitingMinutes
                 });
             })()
         """
@@ -362,6 +379,8 @@ async def extract_server_detail_info(page):
                 info["renew_available"] = d.get("renewAvailable")
                 info["renew_button_disabled"] = d.get("renewDisabled")
                 info["waiting_days"] = d.get("waitingDays")
+                info["waiting_hours"] = d.get("waitingHours")
+                info["waiting_minutes"] = d.get("waitingMinutes")
             except Exception:
                 pass
     except Exception as e:
@@ -865,20 +884,38 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                 detail_info = await extract_server_detail_info(page)
                 srv_expiry = detail_info.get("expiry_date") or "未知"
                 waiting_days = detail_info.get("waiting_days")
+                waiting_hours = detail_info.get("waiting_hours")
+                waiting_minutes = detail_info.get("waiting_minutes")
                 renew_disabled = detail_info.get("renew_button_disabled")
                 print(f"  [info] 利用期限: {srv_expiry}")
                 print(f"  [info] 续期按钮: {detail_info.get('renew_available') or '(未找到)'}")
                 print(f"  [info] 按钮禁用: {renew_disabled}")
                 if waiting_days is not None:
                     print(f"  [info] 距离可续期还有 {waiting_days} 天")
+                elif waiting_hours is not None:
+                    print(f"  [info] 距离可续期还有 {waiting_hours} 小时")
+                elif waiting_minutes is not None:
+                    print(f"  [info] 距离可续期还有 {waiting_minutes} 分钟")
+
+                # 构造"还需 N 天/N 小时/N 分钟才能续期"消息
+                def _build_waiting_msg(d, h, m):
+                    parts = []
+                    if d is not None:
+                        parts.append(f"{d} 天")
+                    if h is not None:
+                        parts.append(f"{h} 小时")
+                    if m is not None:
+                        parts.append(f"{m} 分钟")
+                    if parts:
+                        return f"⏳ 还需 {' '.join(parts)} 才能续期"
+                    return "⏳ 续期按钮当前禁用（未到续期时间）"
 
                 # ===== 判断按钮状态 + 决定行为 =====
-                if renew_disabled or (waiting_days is not None and waiting_days > 0):
-                    # 按钮禁用：发送"等待续期"通知，不点按钮
-                    if waiting_days is not None:
-                        msg_result = f"⏳ 还需 {waiting_days} 天才能续期"
-                    else:
-                        msg_result = "⏳ 续期按钮当前禁用（未到续期时间）"
+                has_waiting = (waiting_days is not None and waiting_days > 0) or \
+                              (waiting_hours is not None and waiting_hours > 0) or \
+                              (waiting_minutes is not None and waiting_minutes > 0)
+                if renew_disabled or has_waiting:
+                    msg_result = _build_waiting_msg(waiting_days, waiting_hours, waiting_minutes)
                     print(f"  {msg_result}")
                     notify_renew(server_id, server_name, srv_expiry, msg_result, index)
                     await save_debug_screenshot(page, f"{server_id}_waiting", index)
