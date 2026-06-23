@@ -240,9 +240,9 @@ async def dump_page_elements(page, account_idx: int):
         title = await page.evaluate("document.title")
         print(f"  [debug] Title: {title}")
 
-        # 用 JS 提取所有按钮和链接
+        # 用 JS 提取所有按钮和链接（IIFE 格式，nodriver 兼容）
         elements = await page.evaluate("""
-            () => {
+            (function() {
                 const buttons = Array.from(document.querySelectorAll('button')).slice(0, 30).map((b, i) => ({
                     idx: i,
                     text: (b.innerText || '').trim().slice(0, 50),
@@ -261,9 +261,15 @@ async def dump_page_elements(page, account_idx: int):
                     text: (e.innerText || '').trim().slice(0, 50),
                 }));
                 const bodyText = (document.body.innerText || '').slice(0, 500);
-                return {buttons, links, renewElems, bodyText};
-            }
-        """)
+                return JSON.stringify({buttons: buttons, links: links, renewElems: renewElems, bodyText: bodyText});
+            })()
+        """, return_by_value=True)
+        # 解析 JSON 字符串
+        if isinstance(elements, str):
+            try:
+                elements = json.loads(elements)
+            except Exception:
+                elements = None
         if elements:
             print(f"  [debug] buttons ({len(elements.get('buttons', []))}):")
             for b in elements.get("buttons", []):
@@ -283,41 +289,58 @@ async def dump_page_elements(page, account_idx: int):
 
 async def find_and_click_renew(page) -> str:
     """查找并点击 Renew 按钮，返回命中的选择器/文字；找不到返回空字符串"""
-    # 方式 1: 用 nodriver 的 find_element_by_text
+    # 方式 1: 用 nodriver 的 find_element_by_text（最可靠）
     for text in RENEW_SELECTORS_TEXT:
         try:
             elem = await page.find_element_by_text(text, best_match=True)
             if elem:
                 await elem.mouse_click()
                 return f"text='{text}'"
-        except Exception:
+        except Exception as e:
+            # 这个文字查找失败，继续下一个
             continue
 
-    # 方式 2: 用 JS 查找 button/a/input 含特定文字
-    clicked = await page.evaluate("""
-        async (texts) => {
+    # 方式 2: 用 JS 查找 button/a/input 含特定文字（把列表嵌入 JS 字符串）
+    import json as _json
+    texts_json = _json.dumps(RENEW_SELECTORS_TEXT)
+    js_code = f"""
+        (function() {{
+            const texts = {texts_json};
             const allElements = [
                 ...document.querySelectorAll('button:not([disabled]), a:not([disabled]), input[type="submit"], input[type="button"]'),
             ];
-            for (const el of allElements) {
+            for (const el of allElements) {{
                 const elText = (el.innerText || el.value || '').trim();
-                for (const t of texts) {
-                    if (elText.toLowerCase().includes(t.toLowerCase())) {
+                for (const t of texts) {{
+                    if (elText.toLowerCase().includes(t.toLowerCase())) {{
                         el.click();
                         return elText;
-                    }
-                }
-            }
+                    }}
+                }}
+            }}
             // 也尝试 class/id 含 renew
-            for (const el of document.querySelectorAll('[class*="renew"]:not([disabled]), [id*="renew"]:not([disabled]), [data-action*="renew"]')) {
+            for (const el of document.querySelectorAll('[class*="renew"]:not([disabled]), [id*="renew"]:not([disabled]), [data-action*="renew"]')) {{
                 el.click();
                 return '[class/id*="renew"]: ' + (el.innerText || '').trim().slice(0, 30);
-            }
+            }}
+            // 也尝试 class/id 含 extend / 연장 / 갱신
+            for (const sel of ['[class*="extend"]', '[id*="extend"]', '[class*="연장"]', '[class*="갱신"]']) {{
+                for (const el of document.querySelectorAll(sel)) {{
+                    if (el.tagName === 'BUTTON' || el.tagName === 'A' || el.onclick) {{
+                        el.click();
+                        return sel + ': ' + (el.innerText || '').trim().slice(0, 30);
+                    }}
+                }}
+            }}
             return null;
-        }
-    """, RENEW_SELECTORS_TEXT)
-    if clicked:
-        return f"js-click: {clicked}"
+        }})()
+    """
+    try:
+        clicked = await page.evaluate(js_code, await_promise=False, return_by_value=True)
+        if clicked:
+            return f"js-click: {clicked}"
+    except Exception as e:
+        print(f"  [renew] JS 查找失败: {e}")
 
     return ""
 
@@ -413,14 +436,21 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         # 先尝试从首页提取 dashboard 链接
         dashboard_url = None
         try:
-            links = await page.evaluate("""
-                () => {
-                    return Array.from(document.querySelectorAll('a[href]')).map(a => ({
+            links_json = await page.evaluate("""
+                (function() {
+                    return JSON.stringify(Array.from(document.querySelectorAll('a[href]')).map(a => ({
                         text: (a.innerText || '').trim().slice(0, 30),
                         href: a.href,
-                    })).filter(l => l.href);
-                }
-            """)
+                    })).filter(l => l.href));
+                })()
+            """, return_by_value=True)
+            # 解析
+            links = None
+            if isinstance(links_json, str):
+                try:
+                    links = json.loads(links_json)
+                except Exception:
+                    links = None
             print(f"  [debug] 首页找到 {len(links) if links else 0} 个链接")
             # 找关键词的链接
             keywords = ["dashboard", "server", "서버", "대시보드", "panel", "계정", "마이페이지", "내 서버"]
