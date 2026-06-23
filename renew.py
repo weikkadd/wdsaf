@@ -146,15 +146,23 @@ def notify(title: str, content: str) -> None:
 RENEW_THRESHOLD_DAYS = int(os.getenv("RENEW_THRESHOLD_DAYS", "3"))
 
 
-def notify_renew(server_name: str, expiry_date: str, result: str, account_idx: int = 1) -> None:
-    """发送用户期望格式的简洁续期通知"""
+def notify_renew(server_id: str, server_name: str, expiry_date: str, result: str, account_idx: int = 1) -> None:
+    """发送用户期望格式的简洁续期通知（每个服务器一条）
+
+    格式：
+        🎮 {server_id} 续期通知
+        🕐 运行时间: 2026-06-23 19:19:39
+        🖥 服务器: Weirdhost|KR
+        📅 利用期限: 2026-07-07 01:58:01
+        📊 续期结果: ⏳ 还需 7 天才能续期
+    """
     # 运行时间（北京时间）
     from datetime import datetime, timezone, timedelta
     tz_cn = timezone(timedelta(hours=8))
     run_time = datetime.now(tz_cn).strftime("%Y-%m-%d %H:%M:%S")
 
     text = (
-        f"🎮 weirdhost.xyz 续期通知\n"
+        f"🎮 {server_id} 续期通知\n"
         f"🕐 运行时间: {run_time}\n"
         f"🖥 服务器: {server_name}\n"
         f"📅 利用期限: {expiry_date}\n"
@@ -179,6 +187,7 @@ def notify_renew(server_name: str, expiry_date: str, result: str, account_idx: i
         try:
             requests.post(WEBHOOK_URL, json={
                 "text": text,
+                "server_id": server_id,
                 "server": server_name,
                 "expiry_date": expiry_date,
                 "result": result,
@@ -793,159 +802,150 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         else:
             print(f"  [debug] 等待 15 秒后仍无服务器链接，可能服务器列表为空或加载失败")
 
-        # ===== 阶段 2.5: 提取服务器信息 + 利用期限 =====
-        print("  [2.5/4] 提取服务器信息和利用期限...")
+        # ===== 阶段 2.5: 提取服务器列表 =====
+        print("  [2.5/4] 提取服务器列表...")
         server_info = await extract_server_info(page)
         server_name = server_info["server_name"]
-        expiry_date = server_info["expiry_date"]
         server_urls = server_info.get("server_urls", [])
-        print(f"  [info] 服务器: {server_name}")
-        print(f"  [info] 利用期限（从列表页提取）: {expiry_date or '（未找到）'}")
+        print(f"  [info] 服务器名: {server_name}")
         print(f"  [info] 发现 {len(server_urls)} 个服务器详情页: {server_urls}")
 
-        # 如果列表页没找到利用期限，进入第一个服务器详情页找
-        if not expiry_date and server_urls:
-            for srv_url in server_urls[:3]:  # 最多试 3 个
-                print(f"  [info] 尝试从服务器详情页提取: {srv_url}")
-                try:
-                    page = await browser.get(srv_url)
-                    await asyncio.sleep(3)
-                    # CF 检测
-                    if not await wait_for_cf_clearance(page, max_sec=CF_WAIT_MAX_SEC, stage="server-detail"):
-                        print(f"  [warn] 服务器详情页被 CF 拦截，跳过")
-                        continue
-                    if not await is_logged_in(page):
-                        print(f"  [warn] 服务器详情页跳转到 login，跳过")
-                        continue
+        # 如果没有服务器，直接结束
+        if not server_urls:
+            await save_debug_screenshot(page, "no_servers", index)
+            return False, "未发现任何服务器，无法续期"
 
-                    # 等待 '유통기한' / '예측기간' / '연장하기' 出现（最多 20 秒）
-                    print(f"  [debug] 等待详情页渲染 '유통기한' / '연장하기' ...")
-                    for wait_i in range(20):
-                        found_kw = await page.evaluate(r"""
-                            (function() {
-                                const html = document.documentElement.innerHTML || '';
-                                return /유통기한|예측기간|이용기한|만료일|연장하기|expir/i.test(html);
-                            })()
-                        """, return_by_value=True)
-                        if found_kw:
-                            print(f"  [debug] 详情页关键字已渲染（等待 {wait_i} 秒）")
-                            break
-                        await asyncio.sleep(1)
-                    else:
-                        print(f"  [warn] 详情页等待 20 秒后仍未出现关键字")
+        # ===== 阶段 3 + 4: 遍历每个服务器详情页，独立处理 + 发独立通知 =====
+        print(f"\n  [3/4] 遍历 {len(server_urls)} 个服务器...")
+        success_count = 0
+        fail_count = 0
+        results_summary = []
 
-                    detail_info = await extract_server_detail_info(page)
-                    if detail_info["expiry_date"]:
-                        expiry_date = detail_info["expiry_date"]
-                        print(f"  [info] ✓ 从详情页提取到利用期限: {expiry_date}")
-                        print(f"  [info] 续期按钮: {detail_info.get('renew_available') or '(未找到)'}")
-                        print(f"  [info] 按钮禁用: {detail_info.get('renew_button_disabled')}")
-                        if detail_info.get("waiting_days") is not None:
-                            print(f"  [info] 距离可续期还有 {detail_info['waiting_days']} 天")
+        for srv_idx, srv_url in enumerate(server_urls, 1):
+            # 从 URL 提取 server_id，例如 https://hub.weirdhost.xyz/server/9120ade0 → 9120ade0
+            server_id = srv_url.rstrip("/").split("/")[-1]
+            print(f"\n  --- 服务器 {srv_idx}/{len(server_urls)}: {server_id} ({srv_url}) ---")
 
-                        # 判断按钮是否禁用 / 还需等待
-                        waiting_days = detail_info.get("waiting_days")
-                        renew_disabled = detail_info.get("renew_button_disabled")
+            try:
+                page = await browser.get(srv_url)
+                await asyncio.sleep(3)
 
-                        if renew_disabled or (waiting_days is not None and waiting_days > 0):
-                            # 按钮禁用，发送"等待续期"通知
-                            if waiting_days is not None:
-                                msg_result = f"⏳ 还需 {waiting_days} 天才能续期"
-                            else:
-                                msg_result = "⏳ 续期按钮当前禁用（未到续期时间）"
-                            print(f"  {msg_result}")
-                            notify_renew(server_name, expiry_date, msg_result, index)
-                            await save_debug_screenshot(page, "renew_waiting", index)
-                            return True, msg_result
-
-                        # 按钮可点击，执行续期
-                        print(f"  [3/4] 在服务器详情页查找 Renew 按钮...（按钮可点击，执行续期）")
-                        await asyncio.sleep(2)
-                        matched = await find_and_click_renew(page)
-                        if not matched:
-                            await save_debug_screenshot(page, "no_renew_button_detail", index)
-                            await dump_page_elements(page, index)
-                            notify_renew(server_name, expiry_date or "未知", "❌ 未找到 Renew 按钮（可能本周期已续期）", index)
-                            return False, "在服务器详情页未找到 Renew 按钮"
-                        print(f"  ✓ 命中: {matched}")
-
-                        # 阶段 4: 等待结果
-                        print("  [4/4] 等待续期结果...")
-                        await asyncio.sleep(3)
-                        try:
-                            body_text = (await page.evaluate("document.body.innerText") or "").lower()
-                        except Exception:
-                            body_text = ""
-                        success_signals = ["success", "renewed", "续期成功", "已续期", "updated", "완료", "갱신됨", "연장됨", "성공"]
-                        fail_signals = ["failed", "error", "失败", "expired", "forbidden", "denied", "실패"]
-                        if any(s in body_text for s in fail_signals):
-                            await save_debug_screenshot(page, "renew_failed", index)
-                            notify_renew(server_name, expiry_date, f"❌ 续期失败（{body_text[:100]}）", index)
-                            return False, f"续期失败: {body_text[:200]}"
-                        if any(s in body_text for s in success_signals):
-                            await save_debug_screenshot(page, "renew_success", index)
-                            notify_renew(server_name, expiry_date, "✅ 续期成功！", index)
-                            return True, f"续期成功（{matched}）"
-                        await save_debug_screenshot(page, "renew_clicked", index)
-                        notify_renew(server_name, expiry_date, "✅ 续期请求已发送", index)
-                        return True, f"续期请求已发送（{matched}）"
-                    else:
-                        print(f"  [info] 详情页也未找到利用期限")
-                except Exception as e:
-                    print(f"  [warn] 访问详情页异常: {e}")
+                # CF 检测
+                if not await wait_for_cf_clearance(page, max_sec=CF_WAIT_MAX_SEC, stage=f"-{server_id}"):
+                    print(f"  [warn] {server_id} 详情页被 CF 拦截")
+                    notify_renew(server_id, server_name, "未知", "❌ Cloudflare 拦截", index)
+                    fail_count += 1
+                    results_summary.append(f"{server_id}: ❌ CF 拦截")
                     continue
 
-        # 计算剩余天数（如果有）
-        days_left = days_until_expiry(expiry_date) if expiry_date else None
-        if days_left is not None:
-            print(f"  [info] 距离到期还有 {days_left} 天（续期阈值: {RENEW_THRESHOLD_DAYS} 天）")
-        else:
-            print(f"  [info] 无法解析利用期限日期，将强制尝试续期")
+                if not await is_logged_in(page):
+                    print(f"  [warn] {server_id} 详情页跳转到 login（Cookie 失效）")
+                    notify_renew(server_id, server_name, "未知", "❌ Cookie 失效", index)
+                    fail_count += 1
+                    results_summary.append(f"{server_id}: ❌ Cookie 失效")
+                    continue
 
-        # ===== 判断是否需要续期 =====
-        if days_left is not None and days_left > RENEW_THRESHOLD_DAYS:
-            msg = f"⏭ 未到期（剩 {days_left} 天），跳过续期"
-            print(f"  {msg}")
-            notify_renew(server_name, expiry_date, f"⏭ 未到期（剩 {days_left} 天），跳过续期", index)
-            await save_debug_screenshot(page, "not_expired_skipped", index)
-            return True, msg
+                # 等待 '유통기한' / '연장하기' 出现（最多 20 秒）
+                print(f"  [debug] 等待详情页渲染 '유통기한' / '연장하기' ...")
+                for wait_i in range(20):
+                    found_kw = await page.evaluate(r"""
+                        (function() {
+                            const html = document.documentElement.innerHTML || '';
+                            return /유통기한|예측기간|이용기한|만료일|연장하기|expir/i.test(html);
+                        })()
+                    """, return_by_value=True)
+                    if found_kw:
+                        print(f"  [debug] 关键字已渲染（等待 {wait_i} 秒）")
+                        break
+                    await asyncio.sleep(1)
+                else:
+                    print(f"  [warn] 等待 20 秒后仍未出现关键字")
 
-        # ===== 阶段 3: 查找并点击 Renew 按钮 =====
-        print(f"  [3/4] 查找 Renew 按钮...（已到期或剩余 ≤ {RENEW_THRESHOLD_DAYS} 天，需要续期）")
-        await asyncio.sleep(2)
+                # 提取详情页信息
+                detail_info = await extract_server_detail_info(page)
+                srv_expiry = detail_info.get("expiry_date") or "未知"
+                waiting_days = detail_info.get("waiting_days")
+                renew_disabled = detail_info.get("renew_button_disabled")
+                print(f"  [info] 利用期限: {srv_expiry}")
+                print(f"  [info] 续期按钮: {detail_info.get('renew_available') or '(未找到)'}")
+                print(f"  [info] 按钮禁用: {renew_disabled}")
+                if waiting_days is not None:
+                    print(f"  [info] 距离可续期还有 {waiting_days} 天")
 
-        matched = await find_and_click_renew(page)
-        if not matched:
-            await save_debug_screenshot(page, "no_renew_button", index)
-            await dump_page_elements(page, index)
-            notify_renew(server_name, expiry_date or "未知", "❌ 未找到 Renew 按钮（可能本周期已续期）", index)
-            return False, "未发现 Renew 按钮"
-        print(f"  ✓ 命中: {matched}")
+                # ===== 判断按钮状态 + 决定行为 =====
+                if renew_disabled or (waiting_days is not None and waiting_days > 0):
+                    # 按钮禁用：发送"等待续期"通知，不点按钮
+                    if waiting_days is not None:
+                        msg_result = f"⏳ 还需 {waiting_days} 天才能续期"
+                    else:
+                        msg_result = "⏳ 续期按钮当前禁用（未到续期时间）"
+                    print(f"  {msg_result}")
+                    notify_renew(server_id, server_name, srv_expiry, msg_result, index)
+                    await save_debug_screenshot(page, f"{server_id}_waiting", index)
+                    success_count += 1
+                    results_summary.append(f"{server_id}: {msg_result}")
+                    continue
 
-        # ===== 阶段 4: 等待结果 =====
-        print("  [4/4] 等待续期结果...")
-        await asyncio.sleep(3)
+                # 按钮可点击：执行续期
+                print(f"  [debug] 按钮可点击，尝试点击 '연장하기' ...")
+                await asyncio.sleep(2)
+                matched = await find_and_click_renew(page)
+                if not matched:
+                    print(f"  [warn] 未找到可点击的续期按钮")
+                    notify_renew(server_id, server_name, srv_expiry, "❌ 未找到 Renew 按钮（可能本周期已续期）", index)
+                    await save_debug_screenshot(page, f"{server_id}_no_btn", index)
+                    fail_count += 1
+                    results_summary.append(f"{server_id}: ❌ 未找到按钮")
+                    continue
+                print(f"  ✓ 命中: {matched}")
 
-        try:
-            body_text = (await page.evaluate("document.body.innerText") or "").lower()
-        except Exception:
-            body_text = ""
+                # 等待结果
+                print(f"  [debug] 等待续期结果...")
+                await asyncio.sleep(3)
+                try:
+                    body_text = (await page.evaluate("document.body.innerText") or "").lower()
+                except Exception:
+                    body_text = ""
 
-        success_signals = ["success", "renewed", "续期成功", "已续期", "updated", "완료", "갱신됨", "연장됨", "성공"]
-        fail_signals = ["failed", "error", "失败", "expired", "forbidden", "denied", "실패"]
+                success_signals = ["success", "renewed", "续期成功", "已续期", "updated", "완료", "갱신됨", "연장됨", "성공"]
+                fail_signals = ["failed", "error", "失败", "expired", "forbidden", "denied", "실패"]
 
-        if any(s in body_text for s in fail_signals):
-            await save_debug_screenshot(page, "renew_failed", index)
-            notify_renew(server_name, expiry_date or "未知", f"❌ 续期失败（{body_text[:100]}）", index)
-            return False, f"续期失败: {body_text[:200]}"
-        if any(s in body_text for s in success_signals):
-            await save_debug_screenshot(page, "renew_success", index)
-            notify_renew(server_name, expiry_date or "未知", "✅ 续期成功！", index)
-            return True, f"续期成功（{matched}）"
+                if any(s in body_text for s in fail_signals):
+                    msg_result = f"❌ 续期失败（{body_text[:80]}）"
+                    print(f"  {msg_result}")
+                    notify_renew(server_id, server_name, srv_expiry, msg_result, index)
+                    await save_debug_screenshot(page, f"{server_id}_failed", index)
+                    fail_count += 1
+                    results_summary.append(f"{server_id}: {msg_result}")
+                    continue
 
-        await save_debug_screenshot(page, "renew_clicked", index)
-        notify_renew(server_name, expiry_date or "未知", "✅ 续期请求已发送", index)
-        return True, f"续期请求已发送（{matched}）"
+                if any(s in body_text for s in success_signals):
+                    msg_result = "✅ 续期成功！"
+                    print(f"  {msg_result}")
+                    notify_renew(server_id, server_name, srv_expiry, msg_result, index)
+                    await save_debug_screenshot(page, f"{server_id}_success", index)
+                    success_count += 1
+                    results_summary.append(f"{server_id}: {msg_result}")
+                    continue
+
+                # 默认：点击成功但未检测到明确反馈
+                msg_result = "✅ 续期请求已发送"
+                print(f"  {msg_result}")
+                notify_renew(server_id, server_name, srv_expiry, msg_result, index)
+                await save_debug_screenshot(page, f"{server_id}_clicked", index)
+                success_count += 1
+                results_summary.append(f"{server_id}: {msg_result}")
+
+            except Exception as e:
+                print(f"  [warn] 处理 {server_id} 异常: {e}")
+                notify_renew(server_id, server_name, "未知", f"❌ 异常: {str(e)[:80]}", index)
+                fail_count += 1
+                results_summary.append(f"{server_id}: ❌ 异常")
+
+        # 汇总
+        summary = f"共 {len(server_urls)} 个服务器: {success_count} 成功 / {fail_count} 失败\n" + "\n".join(results_summary)
+        print(f"\n  === 汇总 ===\n  {summary}")
+        return (fail_count == 0), summary
 
     except Exception as e:
         return False, f"异常: {e}\n{traceback.format_exc()}"
