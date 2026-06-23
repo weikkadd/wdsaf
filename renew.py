@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weirdhost Auto Renew (v3 - Better CF Detection + Debug Screenshot)
+Weirdhost Auto Renew (v4 - Proxy Support)
+- 支持 VLESS/VMess/Trojan/SS/SOCKS5 代理（通过 PROXY_NODE 环境变量）
+- Cookie 模式登录 + 多账号 + TG/Webhook 通知
+- Cloudflare 反检测 (playwright-stealth + 反指纹)
 """
 
 import os
@@ -9,6 +12,7 @@ import sys
 import json
 import time
 import traceback
+import socket
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
@@ -25,6 +29,8 @@ except ImportError:
         HAS_STEALTH = False
         _stealth = None
 
+from proxy_parser import parse_proxy, get_proxy_protocol, build_xray_config
+
 # ===== 配置 =====
 BASE_URL = "https://hub.weirdhost.xyz"
 DASHBOARD_URL = f"{BASE_URL}/dashboard"
@@ -33,12 +39,19 @@ LOGIN_URL = f"{BASE_URL}/login"
 MAX_COOKIE_SLOTS = 50
 DEBUG_DIR = "/tmp/weirdhost_debug"
 
+# 本地代理端口（Xray 会监听这些端口）
+LOCAL_SOCKS_PORT = int(os.getenv("LOCAL_SOCKS_PORT", "1080"))
+LOCAL_HTTP_PORT = int(os.getenv("LOCAL_HTTP_PORT", "1081"))
+
 # ===== 通知配置 =====
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 
-# Cloudflare 拦截检测关键词（只要命中任一即视为被拦）
+# ===== 代理配置 =====
+PROXY_NODE = os.getenv("PROXY_NODE", "").strip()
+
+# Cloudflare 拦截检测关键词
 CF_SIGNALS = [
     "just a moment",
     "checking your browser",
@@ -49,16 +62,17 @@ CF_SIGNALS = [
     "enable javascript and cookies",
     "正在进行安全验证",
     "请启用 javascript",
-    "ray id",  # 仅在短页面时算
+    "浏览器扩展或网络配置不兼容",
+    "阻止",
+    "安全验证过程",
 ]
 
-# Cloudflare JS Challenge 等待时间
-CF_WAIT_MAX_SEC = 45
+# Cloudflare 等待时间
+CF_WAIT_MAX_SEC = 60
 CF_WAIT_INTERVAL = 3
 
-# Renew 按钮可能的所有选择器（更全面）
+# Renew 按钮选择器（全面）
 RENEW_SELECTORS = [
-    # 文字匹配
     "button:has-text('Renew')",
     "button:has-text('renew')",
     "button:has-text('RENEW')",
@@ -77,14 +91,12 @@ RENEW_SELECTORS = [
     "input[type='submit'][value*='Renew']",
     "input[type='submit'][value*='续期']",
     "input[type='button'][value*='Renew']",
-    # class / data 属性
     "[class*='renew']:not([disabled])",
     "[class*='Renew']:not([disabled])",
     "[data-action='renew']",
     "[data-action='Renew']",
     "[id*='renew']:not([disabled])",
     "[id*='Renew']:not([disabled])",
-    # 通用 button type=submit
     "button[type='submit']:has-text('Renew')",
     "button[type='submit']:has-text('续期')",
 ]
@@ -160,16 +172,12 @@ def parse_cookie_string(cookie_str: str) -> list:
 
 
 def is_cf_blocked(page) -> bool:
-    """
-    检测当前页面是否被 Cloudflare 拦截
-    严格检测：只要命中关键词即视为被拦（不再要求页面短）
-    """
+    """检测 Cloudflare 拦截"""
     try:
         content = page.content().lower()
     except Exception:
         return False
 
-    # 高置信度信号（单独命中即视为拦截）
     strong_signals = [
         "just a moment",
         "checking your browser",
@@ -179,18 +187,18 @@ def is_cf_blocked(page) -> bool:
         "正在进行安全验证",
         "请启用 javascript",
         "enable javascript and cookies",
+        "浏览器扩展或网络配置不兼容",
+        "阻止",
+        "安全验证过程",
     ]
     for sig in strong_signals:
         if sig.lower() in content:
             return True
 
-    # 弱信号（需多个同时命中才算）
     weak_signals = ["cloudflare", "ray id", "attention required"]
     weak_count = sum(1 for sig in weak_signals if sig in content)
-    if weak_count >= 2:
-        # 还需要看页面是否短（CF 错误页通常很短）
-        if len(content) < 8000:
-            return True
+    if weak_count >= 2 and len(content) < 8000:
+        return True
 
     return False
 
@@ -222,33 +230,28 @@ def is_logged_in(page) -> bool:
         url = page.url.lower()
     except Exception:
         return False
-    # 排除明显的登录页 URL
     if "/login" in url or "signin" in url:
         return False
-    # 排除 CF 拦截页 URL（含 __cf_chl_rt_tk 参数）
     if "__cf_chl" in url:
         return False
     return True
 
 
 def save_debug_screenshot(page, name: str, account_idx: int):
-    """保存调试截图，便于排查问题"""
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         path = f"{DEBUG_DIR}/account{account_idx}_{name}.png"
         page.screenshot(path=path, full_page=True)
-        print(f"  [debug] 截图已保存: {path}")
-        # 也保存 HTML
+        print(f"  [debug] 截图: {path}")
         html_path = f"{DEBUG_DIR}/account{account_idx}_{name}.html"
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(page.content())
-        print(f"  [debug] HTML 已保存: {html_path}")
+        print(f"  [debug] HTML: {html_path}")
     except Exception as e:
         print(f"  [debug] 保存截图失败: {e}")
 
 
 def dump_page_elements(page, account_idx: int):
-    """打印页面上所有按钮和链接（用于调试 Renew 按钮找不到的情况）"""
     try:
         print(f"  [debug] === 页面元素 dump ===")
         print(f"  [debug] URL: {page.url}")
@@ -276,7 +279,6 @@ def dump_page_elements(page, account_idx: int):
             except Exception:
                 pass
 
-        # 任何含 renew 字样的元素
         renew_elems = page.query_selector_all("[class*='renew'], [id*='renew'], [data-action*='renew']")
         print(f"  [debug] renew-ish elements ({len(renew_elems)}):")
         for i, e in enumerate(renew_elems[:10]):
@@ -287,7 +289,6 @@ def dump_page_elements(page, account_idx: int):
             except Exception:
                 pass
 
-        # body 文本前 500 字
         body_text = page.inner_text("body")[:500]
         print(f"  [debug] body preview:\n{body_text}")
         print(f"  [debug] === dump end ===")
@@ -295,7 +296,8 @@ def dump_page_elements(page, account_idx: int):
         print(f"  [debug] dump 失败: {e}")
 
 
-def make_browser(p):
+def make_browser(p, proxy_uri: str = ""):
+    """启动带反检测特征的 Chromium，可选配置代理"""
     launch_args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
@@ -308,8 +310,16 @@ def make_browser(p):
         "--enable-webgl",
         "--ignore-certificate-errors",
     ]
-    browser = p.chromium.launch(headless=True, args=launch_args)
-    return browser
+    # 代理配置：如果配了 PROXY_NODE，走本地 Xray 的 SOCKS5
+    launch_kwargs = {"headless": True, "args": launch_args}
+    if proxy_uri:
+        launch_kwargs["proxy"] = {
+            "server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}",
+        }
+        print(f"  [proxy] Playwright 走本地 SOCKS5 127.0.0.1:{LOCAL_SOCKS_PORT} → Xray → {get_proxy_protocol(proxy_uri)}")
+    else:
+        print(f"  [proxy] 未配置代理，直连访问")
+    return p.chromium.launch(**launch_kwargs)
 
 
 def make_context(browser):
@@ -360,14 +370,43 @@ def make_context(browser):
     return context
 
 
-def renew_one(cookie_str: str, index: int) -> tuple:
+def test_proxy_alive(timeout: int = 10) -> bool:
+    """检测本地 SOCKS5 代理是否可用"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(("127.0.0.1", LOCAL_SOCKS_PORT))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def test_proxy_works(timeout: int = 20) -> tuple:
+    """通过代理实际访问一个网站，验证代理出网是否正常。返回 (success, message)"""
+    proxies = {
+        "http":  f"socks5h://127.0.0.1:{LOCAL_SOCKS_PORT}",
+        "https": f"socks5h://127.0.0.1:{LOCAL_SOCKS_PORT}",
+    }
+    try:
+        # 用 ipinfo.io 拿出口 IP
+        r = requests.get("https://ipinfo.io/json", proxies=proxies, timeout=timeout)
+        if r.status_code == 200:
+            d = r.json()
+            return True, f"出口 IP: {d.get('ip')} ({d.get('country')}, {d.get('city')}, {d.get('org', '')[:50]})"
+        return False, f"ipinfo 返回 {r.status_code}"
+    except Exception as e:
+        return False, f"代理出网失败: {e}"
+
+
+def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
     cookies = parse_cookie_string(cookie_str)
     if not cookies:
         return False, "Cookie 格式无效（未找到 key=value 对）"
 
     print(f"\n=== 账号 {index} 开始续期 ===")
     with sync_playwright() as p:
-        browser = make_browser(p)
+        browser = make_browser(p, proxy_uri=PROXY_NODE if use_proxy else "")
         try:
             context = make_context(browser)
             context.add_cookies(cookies)
@@ -381,15 +420,14 @@ def renew_one(cookie_str: str, index: int) -> tuple:
             except PWTimeoutError:
                 return False, "访问首页超时（30s）"
 
-            # 多等一会让 CF challenge 自动放行
             page.wait_for_timeout(2000)
 
             if not wait_for_cf_clearance(page, max_sec=CF_WAIT_MAX_SEC, stage="homepage"):
                 save_debug_screenshot(page, "homepage_cf_blocked", index)
                 return False, (
-                    "Cloudflare 拦截，stealth 反检测也未能通过。\n"
-                    "可能原因：GitHub Actions IP 被严格风控。\n"
-                    "建议：1) 重试 2-3 次  2) 配置代理  3) 改用本地运行"
+                    "Cloudflare 拦截，未能通过验证。\n"
+                    "建议：1) 检查 PROXY_NODE 是否有效  2) 更换代理节点  "
+                    "3) 用住宅 IP 代理  4) 改用本地运行"
                 )
 
             # ===== 阶段 2: 访问 dashboard 验证登录态 =====
@@ -411,7 +449,6 @@ def renew_one(cookie_str: str, index: int) -> tuple:
 
             # ===== 阶段 3: 查找并点击 Renew 按钮 =====
             print("  [3/4] 查找 Renew 按钮...")
-            # 等待 dashboard 完全加载
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except PWTimeoutError:
@@ -432,21 +469,18 @@ def renew_one(cookie_str: str, index: int) -> tuple:
                     continue
 
             if not clicked:
-                # 调试：截图 + dump 页面元素
                 save_debug_screenshot(page, "no_renew_button", index)
                 dump_page_elements(page, index)
                 return False, (
                     "未发现 Renew 按钮（dashboard 上没有任何匹配的按钮）。"
-                    "请查看 Actions artifacts 中的调试截图 (/tmp/weirdhost_debug/)。"
-                    "可能原因：1) 账号未到期，dashboard 不显示 Renew 按钮  "
-                    "2) 按钮文字/选择器未覆盖  3) 页面结构变化"
+                    "请查看 Actions artifacts 中的调试截图。"
+                    "可能原因：1) 账号未到期  2) 按钮选择器未覆盖  3) 页面结构变化"
                 )
 
             # ===== 阶段 4: 等待结果 =====
             print("  [4/4] 等待续期结果...")
             page.wait_for_timeout(3000)
 
-            # 检测成功/失败提示
             try:
                 body_text = page.inner_text("body", timeout=5000).lower()
             except Exception:
@@ -462,7 +496,6 @@ def renew_one(cookie_str: str, index: int) -> tuple:
                 save_debug_screenshot(page, "renew_success", index)
                 return True, f"续期成功（选择器: {matched_selector}）"
 
-            # 默认认为点击成功即续期
             save_debug_screenshot(page, "renew_clicked", index)
             return True, f"续期请求已发送（选择器: {matched_selector}）"
 
@@ -479,9 +512,35 @@ def renew_one(cookie_str: str, index: int) -> tuple:
 
 def main():
     print("=" * 60)
-    print("  Weirdhost Auto Renew (v3 - Better CF Detection)")
+    print("  Weirdhost Auto Renew (v4 - Proxy Support)")
     print("=" * 60)
     print(f"  stealth: {'✓ 已加载' if HAS_STEALTH else '✗ 未安装 playwright-stealth'}")
+
+    # ===== 代理检查 =====
+    use_proxy = bool(PROXY_NODE)
+    if use_proxy:
+        proto = get_proxy_protocol(PROXY_NODE)
+        print(f"  proxy:  ✓ 已配置 {proto} 协议")
+        print(f"          (本地 SOCKS5 127.0.0.1:{LOCAL_SOCKS_PORT})")
+
+        # 检测本地代理是否启动
+        if not test_proxy_alive(timeout=5):
+            msg = f"本地 SOCKS5 代理 127.0.0.1:{LOCAL_SOCKS_PORT} 未启动，请确认 Xray 已运行"
+            print(f"  [ERROR] {msg}")
+            notify("代理错误", msg)
+            sys.exit(1)
+        print(f"  proxy:  ✓ 本地代理端口可达")
+
+        # 测试代理出网
+        ok, msg = test_proxy_works(timeout=20)
+        if ok:
+            print(f"  proxy:  ✓ 出网正常 - {msg}")
+        else:
+            print(f"  proxy:  ✗ {msg}")
+            notify("代理错误", f"代理出网失败: {msg}")
+            sys.exit(1)
+    else:
+        print(f"  proxy:  ✗ 未配置 PROXY_NODE（直连模式，可能被 CF 拦截）")
 
     cookies = load_cookies()
     if not cookies:
@@ -494,7 +553,7 @@ def main():
 
     results = []
     for i, ck in enumerate(cookies, 1):
-        ok, msg = renew_one(ck, i)
+        ok, msg = renew_one(ck, i, use_proxy)
         results.append((i, ok, msg))
         status = "✅" if ok else "❌"
         print(f"  账号 {i}: {status} {msg}")
