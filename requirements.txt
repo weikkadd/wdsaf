@@ -1,2 +1,5 @@
-playwright
-requests
+# Weirdhost Auto Renew - Python Dependencies
+# 锁定主版本，避免 API 变更导致脚本失效
+
+playwright>=1.40,<2.0
+requests>=2.28,<3.0
