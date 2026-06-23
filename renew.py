@@ -101,6 +101,7 @@ RENEW_SELECTORS_TEXT = [
 
 
 def notify(title: str, content: str) -> None:
+    """旧版通用通知（保留兼容）"""
     payload = {"title": title, "content": content, "ts": int(time.time())}
 
     if TG_BOT_TOKEN and TG_CHAT_ID:
@@ -130,6 +131,150 @@ def notify(title: str, content: str) -> None:
             requests.post(WEBHOOK_URL, json=payload, timeout=15)
         except Exception as e:
             print(f"[notify] Webhook 发送失败: {e}", file=sys.stderr)
+
+
+# ===== 新版简洁通知 =====
+# 格式参考：
+#   🎮 weirdhost.xyz 续期通知
+#   🕐 运行时间: 2026-06-23 04:54:59
+#   🖥 服务器: weirdhost.xyzKR
+#   📅 利用期限: 2026-06-25
+#   📊 续期结果: ✅ 续期成功！
+
+# 续期窗口：剩余天数 ≤ 此值时才真正点续期按钮
+RENEW_THRESHOLD_DAYS = int(os.getenv("RENEW_THRESHOLD_DAYS", "3"))
+
+
+def notify_renew(server_name: str, expiry_date: str, result: str, account_idx: int = 1) -> None:
+    """发送用户期望格式的简洁续期通知"""
+    # 运行时间（北京时间）
+    from datetime import datetime, timezone, timedelta
+    tz_cn = timezone(timedelta(hours=8))
+    run_time = datetime.now(tz_cn).strftime("%Y-%m-%d %H:%M:%S")
+
+    text = (
+        f"🎮 weirdhost.xyz 续期通知\n"
+        f"🕐 运行时间: {run_time}\n"
+        f"🖥 服务器: {server_name}\n"
+        f"📅 利用期限: {expiry_date}\n"
+        f"📊 续期结果: {result}"
+    )
+
+    if TG_BOT_TOKEN and TG_CHAT_ID:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TG_CHAT_ID,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"[notify_renew] Telegram 发送失败: {e}", file=sys.stderr)
+
+    if WEBHOOK_URL:
+        try:
+            requests.post(WEBHOOK_URL, json={
+                "text": text,
+                "server": server_name,
+                "expiry_date": expiry_date,
+                "result": result,
+                "account_idx": account_idx,
+                "ts": int(time.time()),
+            }, timeout=15)
+        except Exception as e:
+            print(f"[notify_renew] Webhook 发送失败: {e}", file=sys.stderr)
+
+
+def parse_expiry_date(date_str: str):
+    """解析日期字符串，返回 datetime.date 对象；失败返回 None"""
+    if not date_str:
+        return None
+    from datetime import datetime
+    import re
+    # 清理字符串
+    s = date_str.strip()
+    # 尝试常见格式
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y.%m.%d",
+        "%Y年%m月%d日",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+        "%B %d, %Y",     # June 25, 2026
+        "%b %d, %Y",     # Jun 25, 2026
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    # 尝试正则提取 YYYY-MM-DD
+    m = re.search(r'(\d{4})[-./年](\d{1,2})[-./月](\d{1,2})', s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+        except ValueError:
+            pass
+    return None
+
+
+def days_until_expiry(expiry_date_str: str):
+    """计算距离到期还有多少天；解析失败返回 None"""
+    from datetime import date
+    d = parse_expiry_date(expiry_date_str)
+    if not d:
+        return None
+    return (d - date.today()).days
+
+
+async def extract_server_info(page):
+    """从 dashboard 页面提取服务器名 + 利用期限（韩语/英语兼容）"""
+    info = {"server_name": "Weirdhost", "expiry_date": "未知"}
+    try:
+        js = """
+            (function() {
+                const body = document.body.innerText || '';
+                // 找服务器名（标题或品牌）
+                let serverName = 'Weirdhost';
+                const titleMatch = body.match(/(Weirdhost\\s*\\|\\s*\\w+)/i);
+                if (titleMatch) serverName = titleMatch[1].replace(/\\s+/g, '');
+                // 找利用期限/到期日（韩语/英语/中文/日语）
+                let expiry = '';
+                const patterns = [
+                    /(?:利用期限|利用 期限|만료일|만료|expiration|expir(?:y|ation)(?:\\s*date)?|到期|有効期限)\\s*[:：]?\\s*(\\d{4}[-./]\\d{1,2}[-./]\\d{1,2})/i,
+                    /(?:이용기한|이용 기한|만료일|만료)\\s*[:：]?\\s*(\\d{4}[-./]\\d{1,2}[-./]\\d{1,2})/,
+                    /(\\d{4}[-./]\\d{1,2}[-./]\\d{1,2})\\s*(?:까지|만료|到期|까지)/,
+                ];
+                for (const p of patterns) {
+                    const m = body.match(p);
+                    if (m) { expiry = m[1]; break; }
+                }
+                // 如果上面没找到，直接在 HTML 中搜索 YYYY-MM-DD
+                if (!expiry) {
+                    const html = document.documentElement.innerHTML || '';
+                    const m = html.match(/(20\\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\\d|3[01]))/);
+                    if (m) expiry = m[1];
+                }
+                return JSON.stringify({serverName: serverName, expiry: expiry});
+            })()
+        """
+        result = await page.evaluate(js, return_by_value=True)
+        if isinstance(result, str):
+            try:
+                d = json.loads(result)
+                if d.get("serverName"):
+                    info["server_name"] = d["serverName"]
+                if d.get("expiry"):
+                    info["expiry_date"] = d["expiry"]
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  [info] 提取服务器信息失败: {e}")
+    return info
 
 
 def load_cookies() -> list:
@@ -515,14 +660,41 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
             await save_debug_screenshot(page, "not_logged_in", index)
             return False, "Cookie 已失效，请重新登录获取最新 Cookie"
 
+        # ===== 阶段 2.5: 提取服务器信息 + 利用期限 =====
+        print("  [2.5/4] 提取服务器信息和利用期限...")
+        server_info = await extract_server_info(page)
+        server_name = server_info["server_name"]
+        expiry_date = server_info["expiry_date"]
+        print(f"  [info] 服务器: {server_name}")
+        print(f"  [info] 利用期限: {expiry_date}")
+
+        # 计算剩余天数
+        days_left = days_until_expiry(expiry_date)
+        if days_left is not None:
+            print(f"  [info] 距离到期还有 {days_left} 天（续期阈值: {RENEW_THRESHOLD_DAYS} 天）")
+        else:
+            print(f"  [info] 无法解析利用期限日期，将强制尝试续期")
+
+        # ===== 判断是否需要续期 =====
+        if days_left is not None and days_left > RENEW_THRESHOLD_DAYS:
+            # 未到期，跳过续期
+            msg = f"⏭ 未到期（剩 {days_left} 天），跳过续期"
+            print(f"  {msg}")
+            # 仍然发送简洁通知
+            notify_renew(server_name, expiry_date, f"⏭ 未到期（剩 {days_left} 天），跳过续期", index)
+            await save_debug_screenshot(page, "not_expired_skipped", index)
+            return True, msg
+
         # ===== 阶段 3: 查找并点击 Renew 按钮 =====
-        print("  [3/4] 查找 Renew 按钮...")
+        print(f"  [3/4] 查找 Renew 按钮...（已到期或剩余 ≤ {RENEW_THRESHOLD_DAYS} 天，需要续期）")
         await asyncio.sleep(2)  # 等 dashboard 完全加载
 
         matched = await find_and_click_renew(page)
         if not matched:
             await save_debug_screenshot(page, "no_renew_button", index)
             await dump_page_elements(page, index)
+            # 发送简洁通知：找不到按钮
+            notify_renew(server_name, expiry_date, "❌ 未找到 Renew 按钮（可能本周期已续期或按钮文字未覆盖）", index)
             return False, (
                 "未发现 Renew 按钮（dashboard 上没有任何匹配的按钮）。"
                 "请查看 Actions artifacts 中的调试截图。"
@@ -539,17 +711,21 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
         except Exception:
             body_text = ""
 
-        success_signals = ["success", "renewed", "续期成功", "已续期", "updated", "完成", "成功"]
-        fail_signals = ["failed", "error", "失败", "expired", "forbidden", "denied"]
+        success_signals = ["success", "renewed", "续期成功", "已续期", "updated", "완료", "갱신됨", "연장됨", "성공"]
+        fail_signals = ["failed", "error", "失败", "expired", "forbidden", "denied", "실패"]
 
         if any(s in body_text for s in fail_signals):
             await save_debug_screenshot(page, "renew_failed", index)
+            notify_renew(server_name, expiry_date, f"❌ 续期失败（页面反馈: {body_text[:100]}）", index)
             return False, f"续期失败，页面反馈: {body_text[:200]}"
         if any(s in body_text for s in success_signals):
             await save_debug_screenshot(page, "renew_success", index)
+            notify_renew(server_name, expiry_date, "✅ 续期成功！", index)
             return True, f"续期成功（{matched}）"
 
+        # 默认：点击成功但未检测到明确反馈
         await save_debug_screenshot(page, "renew_clicked", index)
+        notify_renew(server_name, expiry_date, "✅ 续期请求已发送（未检测到失败反馈）", index)
         return True, f"续期请求已发送（{matched}）"
 
     except Exception as e:
