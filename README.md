@@ -8,7 +8,7 @@
 ![Platform](https://img.shields.io/badge/Platform-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white)
 ![Language](https://img.shields.io/badge/Made%20with-Python-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen?style=flat-square)
-![Proxy](https://img.shields.io/badge/Proxy-VLESS%7CVMess%7CTrojan%7CSS%7CSOCKS5-9C27B0?style=flat-square)
+![Proxy](https://img.shields.io/badge/Proxy-VLESS%7CVMess%7CTrojan%7CSS%7CSOCKS5%7CHysteria2%7CTUIC-9C27B0?style=flat-square)
 ![Schedule](https://img.shields.io/badge/Runs%20Daily-UTC%2000%3A00-FF6F00?style=flat-square)
 ![Last Commit](https://img.shields.io/github/last-commit/weikkadd/wdsaf?style=flat-square)
 
@@ -26,7 +26,7 @@
 | ⏰ | **GitHub Actions 自动运行** | 默认每天 UTC 00:00 定时触发 |
 | 🔔 | **双通道通知** | Telegram Bot + Webhook 推送 |
 | 🛡️ | **Cloudflare 反检测** | playwright-stealth + 真实浏览器指纹 + JS Challenge 等待 |
-| 🌐 | **代理支持** | VLESS / VMess / Trojan / Shadowsocks / SOCKS5，绕过 GitHub IP 风控 |
+| 🌐 | **代理支持** | **VLESS / VMess / Trojan / Shadowsocks / SOCKS5 / Hysteria2 / TUIC** 共 7 种协议，绕过 GitHub IP 风控 |
 | 🔒 | **安全存储** | 所有敏感凭据通过 GitHub Secrets 加密存储 |
 | 🐛 | **调试友好** | 失败时自动保存截图 + HTML 作为 artifact |
 
@@ -173,6 +173,47 @@ ss://base64(method:password)@server:port#name
 socks5://user:pass@server:port
 socks5://server:port
 ```
+
+</details>
+
+<details>
+<summary><b>Hysteria2（基于 QUIC，速度快）</b></summary>
+
+```
+hysteria2://auth_secret@server:port?sni=example.com&insecure=0&alpn=h3#name
+# 或简写
+hy2://auth_secret@server:port?sni=example.com#name
+```
+
+参数说明：
+- `auth_secret` - 密码（URL path 部分的 username）
+- `sni` - TLS SNI
+- `insecure` - 是否跳过证书验证（`0` 或 `1`）
+- `alpn` - ALPN，默认 `h3`
+- `obfs=salamander&obfs-password=xxx` - 可选混淆
+
+支持带 obfs 的格式：
+```
+hysteria2://auth_secret@server:port?obfs=salamander&obfs-password=xxx&sni=example.com&insecure=1#name
+```
+
+</details>
+
+<details>
+<summary><b>TUIC（基于 QUIC，低延迟）</b></summary>
+
+```
+tuic://uuid:password@server:port?sni=example.com&congestion_control=bbr&alpn=h3#name
+```
+
+参数说明：
+- `uuid:password` - UUID 和密码
+- `sni` - TLS SNI
+- `congestion_control` - 拥塞控制算法（`bbr` / `cubic` / `new_reno`），默认 `bbr`
+- `udp_relay_mode` - UDP 中继模式（`native` / `quic`），默认 `native`
+- `zero_rtt_handshake` - 是否启用 0-RTT（`0` 或 `1`）
+- `allow_insecure` - 是否跳过证书验证（`0` 或 `1`）
+- `alpn` - ALPN，默认 `h3`
 
 </details>
 
@@ -323,7 +364,7 @@ flowchart TD
 ✔ GitHub Actions 自动运行
 ✔ Telegram + Webhook 双通道通知
 ✔ Cloudflare 拦截检测 + 反检测
-✔ **5 种代理协议支持（VLESS/VMess/Trojan/SS/SOCKS5）**
+✔ **7 种代理协议支持（VLESS/VMess/Trojan/SS/SOCKS5/Hysteria2/TUIC）**
 ✔ 完整异常处理与资源回收
 ✔ 调试 artifact 自动上传
 

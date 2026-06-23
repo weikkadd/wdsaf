@@ -36,66 +36,72 @@ jobs:
       - name: 🌐 Install Playwright Chromium (with system deps)
         run: playwright install --with-deps chromium
 
-      - name: 🔧 Setup Xray-core (if PROXY_NODE configured)
+      - name: 🔧 Setup sing-box (if PROXY_NODE configured)
         if: env.PROXY_NODE != ''
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
           set -e
-          echo "=== 1. 下载 Xray-core ==="
-          XRAY_VERSION="v25.6.9"
-          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
-          mkdir -p /tmp/xray
-          curl -fsSL -o /tmp/xray.zip "$XRAY_URL"
-          cd /tmp/xray && unzip -o /tmp/xray.zip
-          chmod +x xray
-          echo "✓ Xray 已下载: $(/tmp/xray/xray -version | head -1)"
+          echo "=== 1. 下载 sing-box ==="
+          # 动态获取最新稳定版（避免硬编码版本号导致 404）
+          SINGBOX_VERSION=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | \
+            python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          echo "  最新稳定版: $SINGBOX_VERSION"
+          
+          SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION#v}-linux-amd64.tar.gz"
+          echo "  下载: $SINGBOX_URL"
+          
+          mkdir -p /tmp/sing-box
+          curl -fsSL -o /tmp/sing-box.tar.gz "$SINGBOX_URL"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp/sing-box --strip-components=1
+          chmod +x /tmp/sing-box/sing-box
+          echo "✓ sing-box 已下载: $(/tmp/sing-box/sing-box version | head -1)"
 
           echo ""
-          echo "=== 2. 生成 Xray 配置 ==="
+          echo "=== 2. 解析代理协议 + 生成 sing-box 配置 ==="
           python -c "
           import os, json, sys
           sys.path.insert(0, '${{ github.workspace }}')
-          from proxy_parser import parse_proxy, build_xray_config, get_proxy_protocol
+          from proxy_parser import parse_proxy, build_singbox_config, get_proxy_protocol
           proxy = os.getenv('PROXY_NODE', '').strip()
           if not proxy:
               print('ERROR: PROXY_NODE empty'); sys.exit(1)
           proto = get_proxy_protocol(proxy)
           print(f'  protocol: {proto}')
           outbound = parse_proxy(proxy)
-          print(f'  outbound protocol: {outbound[\"protocol\"]}')
-          cfg = build_xray_config(outbound, socks_port=1080, http_port=1081)
-          with open('/tmp/xray/config.json', 'w') as f:
+          print(f'  outbound type: {outbound[\"type\"]}')
+          print(f'  server: {outbound.get(\"server\", \"?\")}:{outbound.get(\"server_port\", \"?\")}')
+          cfg = build_singbox_config(outbound, socks_port=1080)
+          with open('/tmp/sing-box/config.json', 'w') as f:
               json.dump(cfg, f, indent=2)
-          print('  ✓ 配置已生成')
+          print('  ✓ 配置已生成: /tmp/sing-box/config.json')
           "
 
           echo ""
-          echo "=== 3. 启动 Xray（后台） ==="
-          nohup /tmp/xray/xray run -config /tmp/xray/config.json > /tmp/xray/xray.log 2>&1 &
-          XRAY_PID=$!
-          echo $XRAY_PID > /tmp/xray/xray.pid
-          echo "✓ Xray 已启动 (PID=$XRAY_PID)"
+          echo "=== 3. 启动 sing-box（后台） ==="
+          nohup /tmp/sing-box/sing-box run -c /tmp/sing-box/config.json > /tmp/sing-box/singbox.log 2>&1 &
+          SB_PID=$!
+          echo $SB_PID > /tmp/sing-box/singbox.pid
+          echo "✓ sing-box 已启动 (PID=$SB_PID)"
           sleep 3
 
-          if kill -0 $XRAY_PID 2>/dev/null; then
-            echo "✓ Xray 进程存活"
+          if kill -0 $SB_PID 2>/dev/null; then
+            echo "✓ sing-box 进程存活"
           else
-            echo "✗ Xray 启动失败，日志:"
-            cat /tmp/xray/xray.log
+            echo "✗ sing-box 启动失败，日志:"
+            cat /tmp/sing-box/singbox.log
             exit 1
           fi
 
           echo ""
           echo "=== 4. 验证代理出网 ==="
-          # 测试 SOCKS5 端口
           if curl -fsSL --socks5 127.0.0.1:1080 --max-time 20 https://ipinfo.io/json; then
             echo ""
             echo "✓ 代理出网正常"
           else
             echo "✗ 代理出网失败"
-            echo "--- xray.log ---"
-            cat /tmp/xray/xray.log
+            echo "--- singbox.log ---"
+            cat /tmp/sing-box/singbox.log
             exit 1
           fi
 
@@ -120,15 +126,15 @@ jobs:
           name: weirdhost-debug-${{ github.run_id }}
           path: |
             /tmp/weirdhost_debug/
-            /tmp/xray/xray.log
+            /tmp/sing-box/singbox.log
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: 🧹 Cleanup Xray
+      - name: 🧹 Cleanup sing-box
         if: always()
         run: |
-          if [ -f /tmp/xray/xray.pid ]; then
-            PID=$(cat /tmp/xray/xray.pid)
+          if [ -f /tmp/sing-box/singbox.pid ]; then
+            PID=$(cat /tmp/sing-box/singbox.pid)
             kill $PID 2>/dev/null || true
-            echo "Xray (PID=$PID) 已停止"
+            echo "sing-box (PID=$PID) 已停止"
           fi
