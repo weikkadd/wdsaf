@@ -696,6 +696,11 @@ async def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
                 "请查看 Actions artifacts 中的调试截图，确认 weirdhost 实际页面结构。"
             )
 
+        # 现在真正访问 dashboard URL（之前可能停在首页）
+        print(f"  [debug] 访问 dashboard URL: {dashboard_url}")
+        page = await browser.get(dashboard_url)
+        await asyncio.sleep(3)
+
         # 再次 CF 检测（dashboard 也可能被拦）
         if not await wait_for_cf_clearance(page, max_sec=CF_WAIT_MAX_SEC, stage="dashboard"):
             await save_debug_screenshot(page, "dashboard_cf_blocked", index)
