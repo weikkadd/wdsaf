@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weirdhost Auto Renew (v4 - Proxy Support)
-- 支持 VLESS/VMess/Trojan/SS/SOCKS5 代理（通过 PROXY_NODE 环境变量）
+Weirdhost Auto Renew (v5 - sing-box + 7 Protocols)
+- 支持 VLESS/VMess/Trojan/SS/SOCKS5/Hysteria2/TUIC 代理（通过 PROXY_NODE 环境变量）
 - Cookie 模式登录 + 多账号 + TG/Webhook 通知
 - Cloudflare 反检测 (playwright-stealth + 反指纹)
 """
@@ -29,7 +29,7 @@ except ImportError:
         HAS_STEALTH = False
         _stealth = None
 
-from proxy_parser import parse_proxy, get_proxy_protocol, build_xray_config
+from proxy_parser import parse_proxy, get_proxy_protocol, build_singbox_config
 
 # ===== 配置 =====
 BASE_URL = "https://hub.weirdhost.xyz"
@@ -512,7 +512,7 @@ def renew_one(cookie_str: str, index: int, use_proxy: bool) -> tuple:
 
 def main():
     print("=" * 60)
-    print("  Weirdhost Auto Renew (v4 - Proxy Support)")
+    print("  Weirdhost Auto Renew (v5 - sing-box + 7 Protocols)")
     print("=" * 60)
     print(f"  stealth: {'✓ 已加载' if HAS_STEALTH else '✗ 未安装 playwright-stealth'}")
 
